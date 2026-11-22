@@ -63,6 +63,7 @@ class Bot:
         self.strafe_until = 0.0
         self.mode = "hide"
         self.scan = self.rng.random() * TAU
+        self.attacker_id = None
         mf.log("oval-ghost nav", int(self.main.sum()), "free cells")
 
     def _build_graph(self):
@@ -160,6 +161,7 @@ class Bot:
         for ev in obs.get("events") or []:
             if ev.get("type") == "damaged" and ev.get("by") is not None:
                 self.attackers[ev["by"]] = t
+                self.attacker_id = ev["by"]
                 if ev.get("bearing") is not None and ev.get("weapon") != "zone":
                     self.bearings.append((t, float(ev["bearing"])))
         self.bearings = [(tt, b) for tt, b in self.bearings if t - tt < 3.0]
@@ -197,11 +199,9 @@ class Bot:
         if hostile:
             weakest = min(hostile, key=lambda e: float(e.get("hp", 1400)))
             weaker = float(weakest.get("hp", 1400)) < float(me["hp"])
-            close = weakest["_d"] < 95.0
-            # A long sightline against a healthy hunter is a retreat back into cover,
-            # not a duel. Take the fight only when it is one mech and it is close.
-            lone_close = len(hostile) == 1 and close and (hpf >= 0.4 or weaker or float(weakest.get("hp", 1400)) < 380)
-            if lone_close or (endgame and len(hostile) <= 2 and hpf >= 0.38):
+            # A strafe at 90 m gives the squad a clear shot. Fight only up close, and only with an HP edge.
+            lone_close = len(hostile) == 1 and weakest["_d"] < 42.0 and (weaker or float(weakest.get("hp", 1400)) < 500 or hpf > 0.85)
+            if lone_close or (endgame and len(hostile) <= 2 and hpf >= 0.5):
                 self.mode = "fight"
             else:
                 self.mode = "retreat"
@@ -271,18 +271,17 @@ class Bot:
                 speed = 0.0
 
         target = None
-        if hostile:
+        pool = hostile or visible
+        if pool:
             def rank(e):
                 score = e["_d"]
-                if e["id"] in recent:
-                    score -= 70
+                if e["id"] == self.attacker_id or e["id"] in recent:
+                    score -= 80
                 score -= (1400 - float(e.get("hp", 1400))) * 0.1
                 if e.get("charging"):
                     score -= 40
                 return score
-            target = min(hostile, key=rank)
-        elif visible:
-            target = visible[0]
+            target = min(pool, key=rank)
 
         if self.mode == "fight" and target is not None and not zone_urgent and not pocket:
             bearing = math.atan2(float(target["pos"][1]) - y, float(target["pos"][0]) - x)
@@ -333,8 +332,11 @@ class Bot:
         weapons = list(me.get("weapons") or [])
         while len(weapons) < 2:
             weapons.append(None)
+        # Legs keep the escape. Aim and the gun are independent and do not slow a sprint.
+        # A laser charge does (half move speed), so it stays holstered while retreating.
         aim_yaw, aim_pitch, fire = self._aim_and_fire(
-            me, x, y, muzzle_z, target, weapons, visible, hostile, energy
+            me, x, y, muzzle_z, target, weapons, visible, hostile, energy,
+            guns_only=(self.mode != "fight"),
         )
         if aim_yaw is None:
             if self.bearings:
@@ -486,7 +488,7 @@ class Bot:
         n = self.path[min(2, len(self.path) - 1)]
         return math.atan2(float(self.cy[n]) - y, float(self.cx[n]) - x)
 
-    def _aim_and_fire(self, me, x, y, mz, target, weapons, visible, hostile, energy):
+    def _aim_and_fire(self, me, x, y, mz, target, weapons, visible, hostile, energy, guns_only=False):
         fire = [False, False]
         if target is None:
             for i, wp in enumerate(weapons[:2]):
@@ -505,7 +507,8 @@ class Bot:
         err = abs(angdiff(float(me["aim"][0]), yaw))
         dist = max(target["_d"], 1.0)
         tol = math.atan2(2.4, dist) + 0.01
-        shoot = self.mode == "fight" or target in hostile
+        # Returning fire while sprinting to cover. Laser charging is excluded: it halves speed.
+        shoot = self.mode == "fight" or target in hostile or (guns_only and target in visible)
         los = bool(self.W.los(
             [x, y, mz],
             [float(target["pos"][0]), float(target["pos"][1]), float(target["pos"][2]) + 4.5],
@@ -525,6 +528,10 @@ class Bot:
             elif kind == "laser":
                 full = float(wst.get("charge", 0.75))
                 held = float(wp.get("charge") or 0)
+                if guns_only:
+                    # Releasing a partial charge still fires, but starting one would cut speed in half.
+                    fire[i] = False
+                    continue
                 if not shoot:
                     fire[i] = False
                     continue
