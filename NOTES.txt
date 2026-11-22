@@ -1,0 +1,101 @@
+Mech Royale bot by Claude ("oval-ghost") -- LATEST: version 4
+==============================================================
+This folder always holds the newest version that beat the previous one. Each version passed
+the OFFICIAL kit's check.py (joinbuilders.org mechfight-kit.tar.gz) natively AND in the Docker
+sandbox (--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534).
+
+HOW TO SUBMIT
+- Put every file of this folder at the TOP LEVEL of the public GitHub repo you submit
+  (Dockerfile at the top), commit, push, submit the repo URL on the Mech Royale track page.
+- mech-royale-claude.zip = the same files with the folder layout (sim/ inside).
+- Runtime files: Dockerfile, bot.py, arena.py, mechfight.py. Keep LICENSE (MIT) and README.md.
+  sim/ is a local test tool, not part of the Docker image.
+- Older files are kept in the "Old versions" subfolder, renamed with their version number.
+- Git: these are commits on local branch claude-bot of jpptauriarg/mech-royale-bot
+  (not pushed: this session has no GitHub write access).
+
+SCORES_AND_TIPS.md / TACTICS.md (from grokbot) read before this version: real practice score
+of the old main is 2.40 (rank 311/360); local sims are much harsher than the real house bots;
+house bots act as one squad (shared vision, 1 hunter early, more as you kill, all late).
+The simulator now has a --squad mode modelling that; next versions are tuned against it too.
+
+------------------------------------------------------------------------------------------
+VERSION 4  (commit 9922173)
+Official check.py: native PASS (300/300 in time, p99 10.7 ms, max 11.8 ms);
+                   Docker sandbox PASS (300/300 in time, p99 13.8 ms, max 15.3 ms).
+What changed vs version 3:
+- Fights whenever it is loaded and the target is in range, even if a second mech can see it
+  (it still picks the best spot and shoots whoever is hitting it first). Hiding from hunters
+  that come to us anyway only hands them free shots and time to regenerate.
+- Upgrades: plating (+15% max HP) and nanites (faster regen) before armor. Armor is only
+  ~8.7% effective HP and does nothing against the zone, which decides the final circle.
+  (Not measurable in the simulator, which has no upgrades.)
+SIMULATOR, 96 matches per mode, same seeds for both:
+                   version 3   version 4
+  squad  score       0.46        0.54
+  blind  score       1.91        2.57   (kills 181 -> 242, survival 147 s -> 160 s)
+Tried this round and rejected (48 matches per mode; v3 was squad 0.46 / blind ~2.6-2.8):
+  ghost (never start a fight, move silently)        0.29 / 1.23
+  strafing across the target's line while trading   0.38 / 2.38
+  relocating 20-55 m sideways after breaking LOS     0.42 / 2.02
+  opening sprint to the nearest enclosed spot        0.48 / 2.83 (neutral)
+  keeping a hiding spot while still hidden           0.38 / 2.71 (neutral)
+  aiming along the direction of travel               2.28 vs 2.70 blind (worse)
+
+------------------------------------------------------------------------------------------
+VERSION 3  (commit 205500c; simulator squad mode in the next commit)
+Official check.py: native PASS (300/300 in time, p99 11.8 ms, max 14.2 ms);
+                   Docker sandbox PASS (300/300 in time, p99 14.7 ms, max 15.3 ms).
+What changed vs version 2:
+- Loot priority laser > lightning. In the simulator, matches where the bot held a laser
+  averaged 4.4 points vs 0.4 without one (laser = hitscan 315 per charge, out to 280 m).
+- With no laser in the first 3 minutes and no threat near, it walks between points 60-140 m
+  away inside the safe circle (torso sweeping) to find one; remembered lasers count to 200 m.
+- Laser aim leads the target 0.1 s (it is hitscan, not a bullet); a charge starts only when
+  on target or about to peek a target in range. Laser hit rate 62% -> 66%.
+- Tested and rejected: aiming along the direction of travel while moving (scored 2.28 vs 2.70
+  on 96 seeds: seeing threats late costs more than it saves).
+SIMULATOR (blind mode, same seeds for both):
+  seeds 301-348:  version 2 = 1.69 (81 kills)   version 3 = 2.77 (132 kills)
+  seeds 401-496:  version 3 = 2.70 (257 kills, se 0.26)
+  omni seeds 101-132: version 2 = 0.09, version 3 = 0.12
+
+------------------------------------------------------------------------------------------
+VERSION 2  (commit 2630488)
+Official check.py: native PASS (300/300 in time, p99 16.0 ms, max 16.0 ms);
+                   Docker sandbox PASS (300/300 in time, p99 17.2 ms, max 17.4 ms).
+What changed vs version 1:
+- Fights back harder. Measured in the simulator, v1 hit 87% of its gun shots but fired too
+  little and often died with its target nearly dead (126-302 HP left). Now it engages whenever
+  exactly one enemy can see it and it is loaded (gun out to 160 m), never breaks off from a
+  target under 35% HP, and finishes a low target even with a second enemy watching.
+- Faces attackers it cannot see (turns to the damage bearing) and targets whoever is hitting
+  it. v1 sometimes kept aiming at a harmless enemy while another shot it from outside its view.
+- Ranges unseen attackers from the matching gunshot sound (near/mid/far) instead of a guess.
+- Line of fire tries centre, upper body and legs, and trusts an open line while being hit.
+- Laser alert: when a visible enemy charges a laser at it, it breaks line of sight at once.
+- Cornered (one enemy close, no cover within 10 m): fights instead of showing its back.
+- Loot: remembers every lightning/laser pickup it has seen, sweeps its torso in the first
+  75 s to find them, loots dead enemies' weapons. Lightning first: each hit shorts a laser
+  (drops its charge, no new one for 2 s), and the house bots carry lasers.
+- Commits to a hiding spot for 0.6 s (v1 could flip-flop between two spots under fire).
+- Path planning now stops on a real deadline: worst tick 16-19 ms (v1 up to ~40 ms when the
+  test machine was busy).
+
+SIMULATOR SCORES (sim/mechsim.py, 32 matches per mode, seeds 101-132, same for each version)
+Rough stand-in for practice matches, deliberately harsh; compare versions, not absolutes.
+  mode "omni"  = 15 hunters always know roughly where we are (worst case)
+  mode "blind" = hunters only find us by sight
+                      old bot (main)   version 1   version 2
+  blind  mean score        0.08*          0.91        1.16
+  blind  kills / 32         -              29          37
+  blind  survival           -             131 s       137 s
+  omni   mean score        0.00*          0.03        0.12
+  worst reply time          -            40.7 ms     19.4 ms
+  (* old bot measured on seeds 1-12)
+
+------------------------------------------------------------------------------------------
+VERSION 1  (commit a75f231)
+New arena.py (2 m height grid from /arena for line of sight, walkability, A*), zone pathing,
+enclosed camp spots away from enemies, exposure-scored hiding, one-at-a-time fights, gun lead,
+laser aim, no mortars. check.py native + Docker PASS (max 17.2 / 24.2 ms).
