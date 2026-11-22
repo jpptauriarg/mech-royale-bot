@@ -1,14 +1,17 @@
 """Shade: a survival-first mechfight/1 bot.
 
-Placement beats kills. Stay inside the closing circle, keep buildings between
-this mech and other mechs, walk quietly when someone is close, and only shoot
-when a fight is already happening or the circle is too small to hide in.
+Placement beats kills. The practice squad hunts only this mech and stays on
+the ground, so the bot jets onto a roof they cannot path onto, holds still,
+and leaves only when the zone will. The roof blocks eyes at the wall. A far
+eye still clears the edge, so this is cover, not a cloak. Between roofs it
+rotates early, uses cover, and dodges.
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
+import holds as holdmap
 import mechfight as mf
 import nav
 
@@ -93,6 +96,8 @@ class Bot:
         self.last_hit_t = -1e9
         self.last_hit_by: Optional[float] = None
         self.was_out = False
+        self.holds = holdmap.get_holds(hello["map"]["dir"])
+        self.pocket: Optional[holdmap.Hold] = None
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
@@ -102,16 +107,49 @@ class Bot:
         threats = self._threats(x, y, t)
         npcs = self._npc_list(x, y, t)
         urgent = self._needs_next(obs, x, y)
+        previous = self.pocket
+        self.pocket = self._select_pocket(obs, x, y, urgent)
+        if self.pocket is not previous:
+            self.plan_t = -1e9
+        on_roof = self.pocket is not None and self.pocket.contains(x, y)
+        if on_roof:
+            # A hunter at the wall is close in x,y and still on the ground. Stay up.
+            intruder = any(
+                th.get("fresh")
+                and not th.get("phantom")
+                and math.hypot(th["dist"], th["z"] - z) < 12.0
+                for th in threats
+            )
+        else:
+            intruder = any(th.get("fresh") and not th.get("phantom") and th["dist"] < 20 for th in threats)
+        if (
+            self.pocket is not None
+            and self.pocket.contains(x, y)
+            and self._pocket_safe(obs, self.pocket, urgent)
+            and not intruder
+        ):
+            exposed = [
+                th
+                for th in threats
+                if th.get("fresh") and not th.get("phantom") and self.arena.los(x, y, th["x"], th["y"])
+            ]
+            if exposed or self.hurt_until > t:
+                return self._shift(obs, me, x, y, z, exposed)
+            return self._sit(obs, me, threats)
         self._replan(obs, x, y, threats, urgent)
         target, fight = self._pick_target(obs, threats, x, y, z)
         dodge_x, dodge_y, dodge_jump = self._dodge(obs, x, y, z)
         move, boost, jump = self._steer(obs, x, y, threats, npcs, dodge_x, dodge_y, fight, target, urgent)
-        jump = jump or dodge_jump or self._stuck(obs, x, y, move)
-        if self.unstick_until > t:
-            move = [self.unstick_dir[0], self.unstick_dir[1]]
-            jump = True
-            if me["energy"] > 16 and not me["in_zone"]:
-                boost = True
+        vault = self._vaulting(x, y)
+        if vault:
+            move, boost, jump = vault
+        else:
+            jump = jump or dodge_jump or self._stuck(obs, x, y, move)
+            if self.unstick_until > t:
+                move = [self.unstick_dir[0], self.unstick_dir[1]]
+                jump = True
+                if me["energy"] > 16 and not me["in_zone"]:
+                    boost = True
         aim, fire = self._aim_fire(obs, me, x, y, z, target, fight, move)
         action: mf.Action = {
             "tick": obs["tick"],
@@ -298,6 +336,170 @@ class Bot:
         self.wp_i = 0
         self.plan_t = t
 
+    def _circle(self, obs: mf.Observation, urgent: bool) -> Tuple[Vec, float]:
+        return self._dest(obs, urgent)
+
+    def _pocket_safe(self, obs: mf.Observation, pocket: holdmap.Hold, urgent: bool) -> bool:
+        center, radius = self._circle(obs, urgent)
+        margin = 6.0 if radius < 80 else 12.0
+        return math.hypot(pocket.x - center[0], pocket.y - center[1]) <= max(0.0, radius - margin)
+
+    def _select_pocket(self, obs: mf.Observation, x: float, y: float, urgent: bool) -> Optional[holdmap.Hold]:
+        """Nearest jettable courtyard that will still be inside the circle we have to reach."""
+        if not self.holds:
+            return None
+        center, radius = self._circle(obs, urgent)
+        margin = 6.0 if radius < 80 else 12.0
+        limit = max(0.0, radius - margin)
+        current = self.pocket
+        if current is not None and math.hypot(current.x - center[0], current.y - center[1]) <= limit:
+            return current
+        best = None
+        best_key = 1e18
+        for pocket in self.holds:
+            dist_c = math.hypot(pocket.x - center[0], pocket.y - center[1])
+            if dist_c > limit:
+                continue
+            travel = math.hypot(pocket.x - x, pocket.y - y)
+            # The squad deletes anything it can see. The roof we can reach
+            # before that happens beats a taller roof across open ground.
+            # A little centrality only breaks ties between nearby roofs.
+            key = travel + max(0.0, dist_c - 120.0) * 0.15 - min(pocket.wall, 24.0) * 0.4
+            if key < best_key:
+                best_key = key
+                best = pocket
+        return best
+
+    def _shift(
+        self,
+        obs: mf.Observation,
+        me: Dict[str, Any],
+        x: float,
+        y: float,
+        z: float,
+        exposed: List[Dict[str, Any]],
+    ) -> mf.Action:
+        """Stay on this roof, on the side the deck puts between us and the guns."""
+        pocket = self.pocket
+        src = exposed[0] if exposed else None
+        if src is None and self.hurt_bearing is not None:
+            src = {
+                "x": x + math.cos(self.hurt_bearing) * 30.0,
+                "y": y + math.sin(self.hurt_bearing) * 30.0,
+            }
+        tx, ty = x, y
+        if pocket is not None and src is not None:
+            dx, dy = x - src["x"], y - src["y"]
+            mag = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / mag, dy / mag
+            best_d = -1.0
+            for dist in (8.0, 16.0, 28.0, 44.0, 64.0):
+                px, py = x + ux * dist, y + uy * dist
+                if not pocket.contains(px, py):
+                    continue
+                d = math.hypot(px - src["x"], py - src["y"])
+                if d > best_d:
+                    best_d = d
+                    tx, ty = px, py
+        mx, my = tx - x, ty - y
+        mag = math.hypot(mx, my)
+        if mag < 3.0:
+            move = [0.0, 0.0]
+        else:
+            move = [mx / mag, my / mag]
+        aim_x = src["x"] if src is not None else x + 1.0
+        aim_y = src["y"] if src is not None else y
+        action: mf.Action = {
+            "tick": obs["tick"],
+            "move": move,
+            "boost": False,
+            "jump": False,
+            "aim": [math.atan2(aim_y - y, aim_x - x), 0.0],
+            "fire": [False, False],
+        }
+        offer = obs.get("offer")
+        if offer:
+            action["pick"] = self._pick_upgrade(offer)
+        mf.draw.label("roof")
+        return action
+
+    def _sit(self, obs: mf.Observation, me: Dict[str, Any], threats: List[Dict[str, Any]]) -> mf.Action:
+        """Stand silent on the courtyard floor. Walls block ground fire."""
+        yaw = float(me["aim"][0]) + 0.35 * math.sin(float(obs["t"]) * 0.6 + self.slot)
+        action: mf.Action = {
+            "tick": obs["tick"],
+            "move": [0.0, 0.0],
+            "boost": False,
+            "jump": False,
+            "aim": [yaw, 0.15],
+            "fire": [False, False],
+        }
+        offer = obs.get("offer")
+        if offer:
+            action["pick"] = self._pick_upgrade(offer)
+        if self._should_reload(me, False):
+            action["reload"] = True
+        mf.draw.label("roof")
+        if self.pocket is not None:
+            mf.draw.point([self.pocket.x, self.pocket.y, self.pocket.z + 2], "#40c0ff", 6)
+        return action
+
+    def _approach(self, x: float, y: float, pocket: holdmap.Hold) -> Vec:
+        """Open pad just outside this roof, on the side closest to where we are."""
+        best: Optional[Vec] = None
+        best_d = 1e18
+        cx, cy = pocket.x, pocket.y
+        for k in range(16):
+            ang = k * math.tau / 16.0
+            ux, uy = math.cos(ang), math.sin(ang)
+            pad = None
+            for dist in range(6, 140, 4):
+                px, py = cx + ux * dist, cy + uy * dist
+                if pocket.contains(px, py) or self.arena.blocked_at(px, py):
+                    continue
+                if not self.arena.in_bounds(px, py, 2.0):
+                    break
+                qx, qy = px + ux * 8.0, py + uy * 8.0
+                if self.arena.blocked_at(qx, qy) or not self.arena.in_bounds(qx, qy, 2.0):
+                    pad = (px, py)
+                else:
+                    pad = (qx, qy)
+                break
+            if pad is None:
+                continue
+            d = math.hypot(pad[0] - x, pad[1] - y)
+            if d < best_d:
+                best_d = d
+                best = pad
+        if best is None:
+            return cx, cy
+        return best
+
+    def _vaulting(self, x: float, y: float) -> Optional[Tuple[List[float], bool, bool]]:
+        """Jet the wall we are against. A roof we are already on is not a vault."""
+        pocket = self.pocket
+        here = holdmap.hold_at(self.holds, x, y)
+        if pocket is not None and here is pocket:
+            return None
+        if here is not None and here is not pocket:
+            if pocket is not None:
+                tx, ty = pocket.x, pocket.y
+            elif self.goal is not None:
+                tx, ty = self.goal
+            else:
+                return None
+            dx, dy = tx - x, ty - y
+            dist = math.hypot(dx, dy) or 1.0
+            return [dx / dist, dy / dist], True, True
+        if pocket is None:
+            return None
+        gap = pocket.gap(x, y)
+        if gap > 16.0 or gap < 0.4:
+            return None
+        dx, dy = pocket.x - x, pocket.y - y
+        dist = math.hypot(dx, dy) or 1.0
+        return [dx / dist, dy / dist], True, True
+
     def _choose_goal(
         self,
         obs: mf.Observation,
@@ -308,6 +510,8 @@ class Bot:
         dest_c: Vec,
         dest_r: float,
     ) -> Vec:
+        if self.pocket is not None:
+            return self._approach(x, y, self.pocket)
         # Outside the circle we actually have to be in: take the near edge.
         # A far-side camp is only safe once we are already inside it.
         if urgent or not obs["self"]["in_zone"]:
@@ -588,7 +792,8 @@ class Bot:
             yaw = math.atan2(target["y"] - y, target["x"] - x)
             mx += -math.sin(yaw) * side * 0.85
             my += math.cos(yaw) * side * 0.85
-        if not outside and not (fight and float(zone["radius"]) <= 100):
+        heading_in = self.pocket is not None and not self.pocket.contains(x, y)
+        if not outside and not heading_in and not (fight and float(zone["radius"]) <= 100):
             breaker = self._break_los(x, y, mx, my, threats)
             if breaker is not None:
                 mx, my = breaker
@@ -596,17 +801,25 @@ class Bot:
         mag = math.hypot(mx, my)
         if mag < 1e-6:
             return [0.0, 0.0], False, False
-        quiet = self._quiet(obs, threats, urgent, close)
+        # A courtyard is only useful if we reach it. Don't creep while the squad can see us.
+        if self.pocket is not None and not self.pocket.contains(x, y):
+            quiet = False
+        else:
+            quiet = self._quiet(obs, threats, urgent, close)
         scale = self.quiet_scale if quiet else 1.0
         mx, my = mx / mag * scale, my / mag * scale
         boost = False
         energy = float(me["energy"])
+        saving_jet = self.pocket is not None and not self.pocket.contains(x, y)
+        reserve = 28.0 + max(0.0, (self.pocket.wall if saving_jet else 0.0) - 14.0) * 1.2
         if not quiet and energy > 8:
             if not me["in_zone"] or outside:
+                boost = not saving_jet or energy > reserve
+            elif saving_jet and energy > reserve + 12:
                 boost = True
-            elif urgent and energy > 28:
+            elif urgent and energy > 28 and not saving_jet:
                 boost = True
-            elif close and energy > 24:
+            elif close and energy > 24 and not saving_jet:
                 boost = True
         return [mx, my], boost, False
 

@@ -57,6 +57,8 @@ class Arena:
         self.t_step = 1.0
         self.t_nx = self.t_ny = 0
         self.t_scale = 0.01
+        self._prepared: list = []
+        self._buckets: Dict[Tuple[int, int], List[int]] = {}
         try:
             self._load(map_dir)
             self.ok = True
@@ -142,6 +144,12 @@ class Arena:
             return True
         return self.blocked[self._idx(i, j)] != 0
 
+    def point_blocked(self, x: float, y: float) -> bool:
+        """True when this exact point is inside a solid, ignoring prism holes."""
+        if not self.ok:
+            return False
+        return self._sample_blocked(self._prepared, self._buckets, x, y)
+
     def blocked_at(self, x: float, y: float) -> bool:
         if not self.ok:
             return False
@@ -197,6 +205,8 @@ class Arena:
             for j in range(j0, j1 + 1):
                 for i in range(i0, i1 + 1):
                     buckets.setdefault((i, j), []).append(pi)
+        self._prepared = prepared
+        self._buckets = buckets
         # Four samples per cell so thin buildings are not skipped.
         offs = ((0.0, 0.0), (-2.2, -2.2), (2.2, -2.2), (-2.2, 2.2), (2.2, 2.2))
         for j in range(self.ny):
