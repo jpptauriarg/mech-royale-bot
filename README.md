@@ -2,7 +2,7 @@
 
 Survival bot for the Builders Buildathon Mech Royale track (protocol `mechfight/1`).
 
-Practice matches are 15 house bots that hunt only this mech, so the score is how many of them die before we do. The bot paths on a navigation grid to a hidden cell inside the next safe circle, breaks line of sight and regenerates when more than one hunter can see it, and duels a single close mech from a strafe. It dodges incoming bullets and a laser that is aimed at it, picks up a laser or lightning, and takes durability upgrades in this order: hit points, armor, regen.
+Practice matches are 15 house bots that hunt only this mech, so the score is how many of them die before we do. The bot paths on a navigation grid to the nearest hidden cell inside the next safe circle. A gunshot or a boost it can hear starts that run before the hunter is in view. It breaks line of sight and regenerates when more than one hunter can see it, and it duels a single close mech from a strafe. Incoming bullets only nudge the path when they are about to hit. It picks up a laser or lightning, and takes durability upgrades in this order: hit points, armor, regen.
 
 `maps.npz` is built from the official arena by `tools/build_maps.py` (walk surface, building and bridge slabs, canopy, and a 4 m navigation grid). The match still mounts the live map at `/arena`; this bot uses the precomputed grids so a tick stays well under 50 ms.
 

@@ -210,7 +210,21 @@ class Bot:
         else:
             self.mode = "hide"
 
+        heard = self._heard(obs.get("sounds") or [])
+        if heard and self.mode == "hide":
+            # A gunshot or a boost we cannot see yet is a hunter closing in.
+            self.mode = "retreat"
+            self.bearings.append((t, heard[0]))
+
         threats = list(visible[:4])
+        if heard:
+            for bearing, dist in heard[1]:
+                threats.append({
+                    "id": -1,
+                    "pos": [x + math.cos(bearing) * dist, y + math.sin(bearing) * dist, z],
+                    "_d": dist,
+                    "_los": False,
+                })
         for _, bearing in self.bearings[-2:]:
             threats.append({
                 "id": -1,
@@ -224,7 +238,8 @@ class Bot:
                 threats.append(npc)
 
         key = (self.mode, tuple(sorted(int(e.get("id", -1)) for e in visible[:4])))
-        if t - self.plan_t > 2.2 or not self.path or key != self.plan_key:
+        replan_every = 1.0 if self.mode == "retreat" else 2.2
+        if t - self.plan_t > replan_every or not self.path or key != self.plan_key:
             try:
                 self._plan(x, y, z, zone, threats if self.mode != "fight" else threats)
                 self.plan_t = t
@@ -328,10 +343,20 @@ class Bot:
             aim_pitch = 0.02
 
         dodge = self._dodge(x, y, z, obs.get("projectiles") or [], visible)
-        if dodge is not None and not pocket:
-            move_yaw = dodge
+        # Only an imminent shot may change heading. A stream of bullets used to
+        # replace the path to cover, so the mech danced in the open and died.
+        if dodge is not None and not pocket and dodge[0] < 0.32:
+            _tca, dodge_yaw = dodge
+            if move_yaw is None:
+                move_yaw = dodge_yaw
+            else:
+                px, py = math.cos(move_yaw), math.sin(move_yaw)
+                dx, dy = math.cos(dodge_yaw), math.sin(dodge_yaw)
+                move_yaw = math.atan2(py + dy, px + dx)
             speed = 1.0
-            if energy > 20:
+            if self.mode == "retreat":
+                boost = energy > 8
+            elif energy > 22:
                 boost = True
 
         if self.prev is not None and move_yaw is not None and speed > 0.5 and not pocket:
@@ -408,17 +433,23 @@ class Bot:
             score = score - np.where(sel == self.goal, 12.0, 0.0)
         order = np.argsort(score)
         if threats:
-            cand = sel[order[:80]]
-            sc = score[order[:80]].astype(np.float64).copy()
+            # Closest cells first. A long run to a prettier corner is how gunfire catches us.
+            near = np.argsort(dist[sel])[:400]
+            cand = sel[near]
+            sc = (0.4 * dist[cand]).astype(np.float64)
             feet_z = self.W.surf(self.cx[cand], self.cy[cand])
             feet = np.stack([self.cx[cand], self.cy[cand], np.asarray(feet_z, np.float64)], 1)
             for e in threats[:4]:
                 ex, ey, ez = (float(v) for v in e["pos"])
                 eye = np.tile([ex, ey, ez + 8.0], (len(cand), 1))
                 seen = self.W.sees(eye, feet, canopy=True)
-                weight = 170.0 if e.get("id", 0) != -1 else 90.0
-                sc += seen * weight
-            best = int(cand[int(np.argmin(sc))])
+                weight = 250.0 if int(e.get("id", 0)) >= 0 else 120.0
+                sc += seen.astype(np.float64) * weight
+            hidden = np.flatnonzero(sc < 80.0)
+            if hidden.size:
+                best = int(cand[hidden[int(np.argmin(dist[cand[hidden]]))]])
+            else:
+                best = int(cand[int(np.argmin(sc))])
         else:
             best = int(sel[int(order[0])])
         self.goal = best
@@ -525,14 +556,37 @@ class Bot:
         horiz = math.hypot(px - x, py - y) or 1.0
         return math.atan2(py - y, px - x), math.atan2(pz - mz, horiz)
 
+    def _heard(self, sounds):
+        """Bearings worth running from. Returns (primary bearing or None, threat list)."""
+        rank = {"near": 0, "mid": 1, "far": 2}
+        interesting = []
+        for s in sounds:
+            kind = s.get("kind")
+            if kind not in ("gun", "boost", "step", "laser", "laser_charge", "lightning", "mortar"):
+                continue
+            if kind in ("step", "boost") and s.get("dist") == "far":
+                continue
+            dist = {"near": 45.0, "mid": 110.0, "far": 200.0}.get(s.get("dist"), 120.0)
+            if kind == "gun" and s.get("dist") == "far":
+                dist = 200.0
+            interesting.append((rank.get(s.get("dist"), 2), 0 if kind == "gun" else 1, float(s.get("bearing", 0.0)), dist))
+        if not interesting:
+            return None
+        interesting.sort()
+        threats = [(b, d) for _r, _k, b, d in interesting[:3]]
+        return interesting[0][2], threats
+
     def _dodge(self, x, y, z, projectiles, visible):
-        yaw = None
+        """Return (seconds-to-impact, sidestep yaw) for the most urgent shot."""
+        best = None
         for e in visible:
             if not e.get("charging") or not e.get("_facing"):
                 continue
             away = math.atan2(y - float(e["pos"][1]), x - float(e["pos"][0]))
             if abs(angdiff(float((e.get("aim") or [0, 0])[0]), away)) < 0.14:
                 yaw = away + math.pi / 2 * self.strafe
+                if best is None or 0.15 < best[0]:
+                    best = (0.15, yaw)
         mz = z + 4.5
         for p in projectiles:
             pos = p.get("pos") or [0, 0, 0]
@@ -547,10 +601,10 @@ class Bot:
                 continue
             miss = math.hypot(x - (px + vx * tca), y - (py + vy * tca), mz - (pz + vz * tca))
             limit = 9.0 if p.get("kind") == "mortar" else 4.2
-            if miss < limit:
+            if miss < limit and (best is None or tca < best[0]):
                 side = 1.0 if ((x - px) * -vy + (y - py) * vx) > 0 else -1.0
-                yaw = math.atan2(vy, vx) + math.pi / 2 * side
-        return yaw
+                best = (tca, math.atan2(vy, vx) + math.pi / 2 * side)
+        return best
 
     def _loot(self, obs, me, act, weapons):
         x, y, z = (float(v) for v in me["pos"])
