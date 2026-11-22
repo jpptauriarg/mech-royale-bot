@@ -327,7 +327,7 @@ class Bot:
         # Squad bots hunt on sight and do not fight each other. Stay on the
         # outer face of a building until one hunter is alone and we have cover.
         if self._should_hide(obs, x, y, threats):
-            camp = self._shadow_camp(x, y, threats, dest_c, dest_r)
+            camp = self._shadow_camp(obs, x, y, threats, dest_c, dest_r)
             if camp is not None:
                 return camp
         # Outside the circle we actually have to be in: take the near edge.
@@ -383,12 +383,6 @@ class Bot:
             return best
         return self.arena.nearest_open(dest_c[0], dest_c[1], 8)
 
-    def _inside_next(self, obs: mf.Observation, x: float, y: float) -> bool:
-        zone = obs["zone"]
-        center = zone["next_center"]
-        radius = float(zone["next_radius"])
-        return math.hypot(x - float(center[0]), y - float(center[1])) <= max(0.0, radius - self._margin(radius))
-
     def _inside(self, p: Vec, c: Vec, r: float) -> bool:
         return math.hypot(p[0] - c[0], p[1] - c[1]) <= max(4.0, r - 2.0)
 
@@ -428,30 +422,76 @@ class Bot:
             return False
         return self._isolated(obs, x, y, threats) is None
 
+    def _anchor(self, obs: mf.Observation, x: float, y: float, threats: List[Dict[str, Any]], dest_c: Vec) -> Vec:
+        """Who we have to put a building in front of. A hit bearing counts before we see them."""
+        live = [
+            th
+            for th in threats
+            if th.get("fresh") and not th.get("phantom") and th["dist"] < 210.0 and self.arena.los(x, y, th["x"], th["y"])
+        ]
+        if live:
+            th = min(live, key=lambda item: item["dist"])
+            return th["x"], th["y"]
+        t = float(obs["t"])
+        if self.hurt_bearing is not None and t < self.hurt_until + 6.0:
+            return (
+                x + math.cos(self.hurt_bearing) * 70.0,
+                y + math.sin(self.hurt_bearing) * 70.0,
+            )
+        return dest_c
+
+    def _sidestep(self, x: float, y: float, bearing: float) -> Vec:
+        srcx = x + math.cos(bearing) * 55.0
+        srcy = y + math.sin(bearing) * 55.0
+        latx, laty = -math.sin(bearing), math.cos(bearing)
+        best = (latx, laty)
+        best_s = -1e9
+        for sign in (1.0, -1.0):
+            score = -30.0
+            for dist in (6.0, 10.0, 16.0, 24.0, 36.0):
+                px = x + latx * sign * dist
+                py = y + laty * sign * dist
+                if self.arena.blocked_at(px, py):
+                    break
+                if not self.arena.los(px, py, srcx, srcy):
+                    score = 120.0 - dist
+                    break
+            if score > best_s:
+                best_s = score
+                best = (latx * sign, laty * sign)
+        return best
+
     def _in_shadow(self, x: float, y: float, obs: mf.Observation, threats: List[Dict[str, Any]]) -> bool:
         for th in threats:
             if th.get("phantom") or not th.get("fresh"):
                 continue
             if th["dist"] < 210.0 and self.arena.los(x, y, th["x"], th["y"]):
                 return False
-        center = obs["zone"]["center"]
-        dx, dy = float(center[0]) - x, float(center[1]) - y
-        dist = math.hypot(dx, dy) or 1.0
-        if not self._blocked_along(x, y, dx / dist, dy / dist, 12.0):
+        if not self.arena.has_cover(x, y):
             return False
-        return self.arena.has_cover(x, y)
+        center = obs["zone"]["center"]
+        dest = (float(center[0]), float(center[1]))
+        anchor = self._anchor(obs, x, y, threats, dest)
+        for ox, oy in (anchor, dest):
+            dx, dy = ox - x, oy - y
+            dist = math.hypot(dx, dy) or 1.0
+            if self._blocked_along(x, y, dx / dist, dy / dist, 12.0):
+                return True
+        return False
 
     def _shadow_camp(
         self,
+        obs: mf.Observation,
         x: float,
         y: float,
         threats: List[Dict[str, Any]],
         dest_c: Vec,
         dest_r: float,
     ) -> Optional[Vec]:
-        """Outer face of the nearest building: the circle is on the other side of the wall."""
+        """A wall between us and whoever is shooting, still inside the circle."""
         limit = max(0.0, dest_r - self._margin(dest_r))
-        if math.hypot(x - dest_c[0], y - dest_c[1]) <= limit and self._shadowed_cell(x, y, dest_c, threats):
+        anchor = self._anchor(obs, x, y, threats, dest_c)
+        if math.hypot(x - dest_c[0], y - dest_c[1]) <= limit and self._in_shadow(x, y, obs, threats):
             return x, y
         arena = self.arena
         i0, j0 = arena.cell_at(x, y)
@@ -472,7 +512,7 @@ class Bot:
                 py = arena.miny + (j + 0.5) * cell
                 if math.hypot(px - dest_c[0], py - dest_c[1]) > limit:
                     continue
-                vx, vy = dest_c[0] - px, dest_c[1] - py
+                vx, vy = anchor[0] - px, anchor[1] - py
                 vd = math.hypot(vx, vy) or 1.0
                 if not self._blocked_along(px, py, vx / vd, vy / vd, 14.0):
                     continue
@@ -500,16 +540,6 @@ class Bot:
                 fallback_s = score
                 fallback = (px, py)
         return hidden if hidden is not None else fallback
-
-    def _shadowed_cell(self, x: float, y: float, dest_c: Vec, threats: List[Dict[str, Any]]) -> bool:
-        for th in threats:
-            if th.get("phantom") or not th.get("fresh"):
-                continue
-            if th["dist"] < 210.0 and self.arena.los(x, y, th["x"], th["y"]):
-                return False
-        dx, dy = dest_c[0] - x, dest_c[1] - y
-        dist = math.hypot(dx, dy) or 1.0
-        return self._blocked_along(x, y, dx / dist, dy / dist, 12.0) and self.arena.has_cover(x, y)
 
     def _cover_point(self, x: float, y: float, bearing: float) -> Optional[Vec]:
         away = bearing + math.pi
@@ -741,6 +771,15 @@ class Bot:
             breaker = self._break_los(x, y, mx, my, threats)
             if breaker is not None:
                 mx, my = breaker
+        # A hunter we have not turned to face still gives us a hit bearing.
+        # Sidestep behind the nearest corner instead of running in a straight line.
+        if (
+            hiding
+            and self.hurt_bearing is not None
+            and float(obs["t"]) < self.hurt_until + 1.2
+            and not self._in_shadow(x, y, obs, threats)
+        ):
+            mx, my = self._sidestep(x, y, self.hurt_bearing)
         mx, my = self.arena.avoid(x, y, mx, my)
         mag = math.hypot(mx, my)
         if mag < 1e-6:
