@@ -113,6 +113,15 @@ class Bot:
             if me["energy"] > 16 and not me["in_zone"]:
                 boost = True
         aim, fire = self._aim_fire(obs, me, x, y, z, target, fight, move)
+        # Aim is independent of move. While the path is still taking us to a wall,
+        # shoot the nearest hunter. This does not change the escape vector.
+        escaping = (not self.arena.has_cover(x, y)) or (
+            self._should_hide(obs, x, y, threats) and not self._in_shadow(x, y, obs, threats)
+        )
+        if escaping and not fight:
+            shooter = self._nearest_attacker(x, y, threats)
+            if shooter is not None:
+                aim, fire = self._aim_fire(obs, me, x, y, z, shooter, True, move)
         # The squad hunts on sight. Once a building sits between us and the
         # circle, standing still denies that sight and starts regen.
         if fight:
@@ -141,7 +150,7 @@ class Bot:
             action["take"] = taken[0]
             if taken[1] is not None:
                 action["drop"] = taken[1]
-        if self._should_reload(me, fight):
+        if self._should_reload(me, fight) and not escaping:
             action["reload"] = True
         offer = obs.get("offer")
         if offer:
@@ -920,6 +929,26 @@ class Bot:
         self.unstick_until = t + 1.1
         self.plan_t = -1e9
         return True
+
+    def _nearest_attacker(
+        self,
+        x: float,
+        y: float,
+        threats: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        seeing = [
+            th
+            for th in threats
+            if th.get("fresh")
+            and not th.get("phantom")
+            and th["dist"] < 220.0
+            and self.arena.los(x, y, th["x"], th["y"])
+        ]
+        # Several guns at once: keep running. One hunter, and we can shoot back
+        # without giving the rest of the squad a new reason to close.
+        if len(seeing) != 1:
+            return None
+        return seeing[0]
 
     def _pick_target(
         self,
