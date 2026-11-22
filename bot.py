@@ -325,6 +325,10 @@ class Bot:
             if move_yaw is None:
                 nx, ny = _xy(zone.get("next_center"), (cx, cy))
                 move_yaw = math.atan2(ny - y, nx - x)
+        elif self.mode == "hide" and path_m > 20.0 and energy > 40.0 and t < 40.0:
+            # Cross the opening ground before a hunter closes. Boost carries about 90 m.
+            boost = True
+            speed = 1.0
 
         weapons = list(me.get("weapons") or [])
         while len(weapons) < 2:
