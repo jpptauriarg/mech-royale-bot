@@ -113,6 +113,21 @@ class Bot:
             if me["energy"] > 16 and not me["in_zone"]:
                 boost = True
         aim, fire = self._aim_fire(obs, me, x, y, z, target, fight, move)
+        # The squad hunts on sight. Once a building sits between us and the
+        # circle, standing still denies that sight and starts regen.
+        if fight:
+            pass
+        elif (
+            not urgent
+            and me["in_zone"]
+            and self._should_hide(obs, x, y, threats)
+            and self._in_shadow(x, y, obs, threats)
+        ):
+            if abs(dodge_x) + abs(dodge_y) < 0.35:
+                move = [0.0, 0.0]
+                boost = False
+                jump = False
+                fire = [False, False]
         action: mf.Action = {
             "tick": obs["tick"],
             "move": move,
@@ -287,7 +302,8 @@ class Bot:
         outside = not obs["self"]["in_zone"]
         out_now = outside and not self.was_out
         self.was_out = outside
-        interval = 0.35 if outside or urgent else 0.7
+        hiding = self._should_hide(obs, x, y, threats)
+        interval = 0.2 if hiding else (0.35 if outside or urgent else 0.7)
         if self.waypoints and t - self.plan_t < interval and not hurt_now and not out_now and t >= self.unstick_until:
             return
         dest_c, dest_r = self._dest(obs, urgent)
@@ -308,6 +324,12 @@ class Bot:
         dest_c: Vec,
         dest_r: float,
     ) -> Vec:
+        # Squad bots hunt on sight and do not fight each other. Stay on the
+        # outer face of a building until one hunter is alone and we have cover.
+        if self._should_hide(obs, x, y, threats):
+            camp = self._shadow_camp(x, y, threats, dest_c, dest_r)
+            if camp is not None:
+                return camp
         # Outside the circle we actually have to be in: take the near edge.
         # A far-side camp is only safe once we are already inside it.
         if urgent or not obs["self"]["in_zone"]:
@@ -361,11 +383,133 @@ class Bot:
             return best
         return self.arena.nearest_open(dest_c[0], dest_c[1], 8)
 
+    def _inside_next(self, obs: mf.Observation, x: float, y: float) -> bool:
+        zone = obs["zone"]
+        center = zone["next_center"]
+        radius = float(zone["next_radius"])
+        return math.hypot(x - float(center[0]), y - float(center[1])) <= max(0.0, radius - self._margin(radius))
+
     def _inside(self, p: Vec, c: Vec, r: float) -> bool:
         return math.hypot(p[0] - c[0], p[1] - c[1]) <= max(4.0, r - 2.0)
 
     def _hot(self, threats: List[Dict[str, Any]], dist: float) -> bool:
         return any((not th.get("phantom")) and th["dist"] < dist for th in threats)
+
+    def _blocked_along(self, x: float, y: float, ux: float, uy: float, reach: float) -> bool:
+        step = 4.0
+        while step <= reach:
+            if self.arena.blocked_at(x + ux * step, y + uy * step):
+                return True
+            step += 4.0
+        return False
+
+    def _isolated(
+        self,
+        obs: mf.Observation,
+        x: float,
+        y: float,
+        threats: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """One hunter, in the open relative to us, and a wall at our shoulder."""
+        if float(obs["t"]) < 75.0 or float(obs["zone"]["radius"]) <= 100.0:
+            return None
+        visible = [th for th in threats if th.get("fresh") and not th.get("phantom")]
+        if sum(1 for th in visible if th["dist"] < 120.0) != 1:
+            return None
+        th = min(visible, key=lambda item: item["dist"])
+        if th["dist"] > 150.0 or not self.arena.los(x, y, th["x"], th["y"]):
+            return None
+        if not self.arena.has_cover(x, y):
+            return None
+        return th
+
+    def _should_hide(self, obs: mf.Observation, x: float, y: float, threats: List[Dict[str, Any]]) -> bool:
+        if float(obs["zone"]["radius"]) <= 100.0:
+            return False
+        return self._isolated(obs, x, y, threats) is None
+
+    def _in_shadow(self, x: float, y: float, obs: mf.Observation, threats: List[Dict[str, Any]]) -> bool:
+        for th in threats:
+            if th.get("phantom") or not th.get("fresh"):
+                continue
+            if th["dist"] < 210.0 and self.arena.los(x, y, th["x"], th["y"]):
+                return False
+        center = obs["zone"]["center"]
+        dx, dy = float(center[0]) - x, float(center[1]) - y
+        dist = math.hypot(dx, dy) or 1.0
+        if not self._blocked_along(x, y, dx / dist, dy / dist, 12.0):
+            return False
+        return self.arena.has_cover(x, y)
+
+    def _shadow_camp(
+        self,
+        x: float,
+        y: float,
+        threats: List[Dict[str, Any]],
+        dest_c: Vec,
+        dest_r: float,
+    ) -> Optional[Vec]:
+        """Outer face of the nearest building: the circle is on the other side of the wall."""
+        limit = max(0.0, dest_r - self._margin(dest_r))
+        if math.hypot(x - dest_c[0], y - dest_c[1]) <= limit and self._shadowed_cell(x, y, dest_c, threats):
+            return x, y
+        arena = self.arena
+        i0, j0 = arena.cell_at(x, y)
+        cell = arena.cell
+        ranked = []
+        for dj in range(-16, 17):
+            for di in range(-16, 17):
+                i, j = i0 + di, j0 + dj
+                if arena.is_blocked_cell(i, j):
+                    continue
+                walls = 0
+                for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                    if arena.is_blocked_cell(ni, nj):
+                        walls += 1
+                if walls == 0:
+                    continue
+                px = arena.minx + (i + 0.5) * cell
+                py = arena.miny + (j + 0.5) * cell
+                if math.hypot(px - dest_c[0], py - dest_c[1]) > limit:
+                    continue
+                vx, vy = dest_c[0] - px, dest_c[1] - py
+                vd = math.hypot(vx, vy) or 1.0
+                if not self._blocked_along(px, py, vx / vd, vy / vd, 14.0):
+                    continue
+                travel = math.hypot(px - x, py - y)
+                ranked.append((travel - walls * 10.0, travel, px, py))
+        if not ranked:
+            return None
+        ranked.sort()
+        hidden = None
+        hidden_d = 1e18
+        fallback = None
+        fallback_s = 1e18
+        for _key, travel, px, py in ranked[:40]:
+            seen = 0
+            for th in threats:
+                if th.get("phantom") or not th.get("fresh") or th["dist"] > 220.0:
+                    continue
+                if arena.los(px, py, th["x"], th["y"]):
+                    seen += 1
+            if seen == 0 and travel < hidden_d:
+                hidden_d = travel
+                hidden = (px, py)
+            score = travel + seen * 120.0
+            if score < fallback_s:
+                fallback_s = score
+                fallback = (px, py)
+        return hidden if hidden is not None else fallback
+
+    def _shadowed_cell(self, x: float, y: float, dest_c: Vec, threats: List[Dict[str, Any]]) -> bool:
+        for th in threats:
+            if th.get("phantom") or not th.get("fresh"):
+                continue
+            if th["dist"] < 210.0 and self.arena.los(x, y, th["x"], th["y"]):
+                return False
+        dx, dy = dest_c[0] - x, dest_c[1] - y
+        dist = math.hypot(dx, dy) or 1.0
+        return self._blocked_along(x, y, dx / dist, dy / dist, 12.0) and self.arena.has_cover(x, y)
 
     def _cover_point(self, x: float, y: float, bearing: float) -> Optional[Vec]:
         away = bearing + math.pi
@@ -539,6 +683,7 @@ class Bot:
         urgent: bool,
     ) -> Tuple[List[float], bool, bool]:
         me = obs["self"]
+        hiding = self._should_hide(obs, x, y, threats)
         wx, wy = self._waypoint(x, y)
         dx, dy = wx - x, wy - y
         mag = math.hypot(dx, dy) or 1.0
@@ -559,6 +704,10 @@ class Bot:
             d = max(th["dist"], 1.0)
             fx += (x - th["x"]) / d * w
             fy += (y - th["y"]) / d * w
+        if hiding:
+            # The camp path is the escape. Fleeing sideways keeps us in the open.
+            fx = fy = 0.0
+            close = False
         for npc in npcs:
             if npc["dist"] < 40:
                 d = max(npc["dist"], 1.0)
@@ -596,12 +745,14 @@ class Bot:
         mag = math.hypot(mx, my)
         if mag < 1e-6:
             return [0.0, 0.0], False, False
-        quiet = self._quiet(obs, threats, urgent, close)
+        quiet = False if hiding else self._quiet(obs, threats, urgent, close)
         scale = self.quiet_scale if quiet else 1.0
         mx, my = mx / mag * scale, my / mag * scale
         boost = False
         energy = float(me["energy"])
-        if not quiet and energy > 8:
+        if hiding and energy > 14 and not (self._in_shadow(x, y, obs, threats) and not urgent and me["in_zone"]):
+            boost = True
+        elif not quiet and energy > 8:
             if not me["in_zone"] or outside:
                 boost = True
             elif urgent and energy > 28:
@@ -740,7 +891,12 @@ class Bot:
         z: float,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         visible = [th for th in threats if th.get("fresh") and not th.get("phantom")]
+        isolated = self._isolated(obs, x, y, threats)
+        if isolated is not None:
+            return isolated, True
         if not visible:
+            return None, False
+        if self._should_hide(obs, x, y, threats):
             return None, False
         target = min(visible, key=lambda th: th["dist"])
         me = obs["self"]
