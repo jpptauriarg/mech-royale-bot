@@ -164,7 +164,7 @@ def obs_zone(phases, t):
 
 
 class Sim:
-    def __init__(self, seed, policy):
+    def __init__(self, seed, policy, strat="main"):
         self.seed = seed
         self.policy = policy
         self.rng = random.Random(seed)
@@ -173,6 +173,7 @@ class Sim:
         self.hello = json.loads(json.dumps(HELLO))
         self.hello["seed"] = seed
         self.hello["slot"] = 0
+        self.hello["strat"] = strat
         self.bot = ghost.Bot(self.hello)
         self.mechs = self._spawn()
         self.player = self.mechs[0]
@@ -758,6 +759,7 @@ def main():
     ap.add_argument("--matches", type=int, default=8)
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--policy", choices=("ghost", "baseline", "both"), default="both")
+    ap.add_argument("--strat", default="main", choices=("main", "pure", "fortress", "alpha", "barnacle"))
     args = ap.parse_args()
     policies = ["ghost", "baseline"] if args.policy == "both" else [args.policy]
     for policy in policies:
@@ -766,7 +768,7 @@ def main():
         for i in range(args.matches):
             seed = args.seed0 + i
             ts = time.perf_counter()
-            row = Sim(seed, policy).run()
+            row = Sim(seed, policy, strat=args.strat).run()
             rows.append(row)
             print(
                 f"{policy} seed {seed} place {row['place']} points {row['points']} "

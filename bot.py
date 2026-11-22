@@ -64,7 +64,8 @@ class Bot:
         self.mode = "hide"
         self.scan = self.rng.random() * TAU
         self.attacker_id = None
-        mf.log("oval-ghost nav", int(self.main.sum()), "free cells")
+        self.strat = os.environ.get("MB_STRAT") or hello.get("strat") or "main"
+        mf.log("oval-ghost nav", int(self.main.sum()), "free cells", "strat", self.strat)
 
     def _build_graph(self):
         nb = self.W.navblk
@@ -108,6 +109,22 @@ class Bot:
         self.main = labels == big
         _, nearest = distance_transform_edt(~self.main.reshape(h, w), return_indices=True)
         self.near_main = (nearest[0] * w + nearest[1]).ravel()
+        grid = self.main.reshape(h, w) & ~nb
+        up = np.zeros_like(nb); up[1:, :] = nb[:-1, :]
+        down = np.zeros_like(nb); down[:-1, :] = nb[1:, :]
+        left = np.zeros_like(nb); left[:, 1:] = nb[:, :-1]
+        right = np.zeros_like(nb); right[:, :-1] = nb[:, 1:]
+        ortho = up.astype(np.int8) + down.astype(np.int8) + left.astype(np.int8) + right.astype(np.int8)
+        self.pocket = np.flatnonzero(grid & (ortho >= 3))
+        # Opening of the pocket: one free orthogonal side, used as the facing.
+        self.pocket_face = np.zeros(h * w, np.float32)
+        for n in self.pocket:
+            j, i = divmod(int(n), w)
+            for dj, di in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                jj, ii = j + dj, i + di
+                if 0 <= jj < h and 0 <= ii < w and not nb[jj, ii]:
+                    self.pocket_face[n] = math.atan2(dj, di)
+                    break
 
     def node(self, x, y):
         i = int((x - self.W.x0) // self.cell)
@@ -145,6 +162,14 @@ class Bot:
         return yaw
 
     def act(self, obs):
+        if self.strat in ("pure", "ghost"):
+            return self.act_pure(obs)
+        if self.strat == "fortress":
+            return self.act_fortress(obs)
+        if self.strat == "alpha":
+            return self.act_alpha(obs)
+        if self.strat == "barnacle":
+            return self.act_barnacle(obs)
         me = obs["self"]
         x, y, z = (float(v) for v in me["pos"])
         t = float(obs.get("t", 0.0))
@@ -401,6 +426,314 @@ class Bot:
                 if ammo <= max(2.0, mag * 0.34):
                     act["reload"] = True
         return act
+
+    def _sense(self, obs):
+        me = obs["self"]
+        x, y, z = (float(v) for v in me["pos"])
+        t = float(obs.get("t", 0.0))
+        zone = obs.get("zone") or {}
+        act = {}
+        offer = obs.get("offer")
+        if offer and offer.get("choices"):
+            act["pick"] = self._pick(offer["choices"])
+        enemies = []
+        for actor in obs.get("mechs") or []:
+            if actor.get("kind") != "mech":
+                continue
+            enemies.append(actor)
+        eye_z = z + float((me.get("stats") or {}).get("eye_height", 8.0))
+        if enemies:
+            feet = np.array([[e["pos"][0], e["pos"][1], e["pos"][2]] for e in enemies], np.float64)
+            seen = self.W.sees(np.tile([x, y, eye_z], (len(enemies), 1)), feet, canopy=False)
+        else:
+            seen = []
+        visible = []
+        for e, ok in zip(enemies, seen):
+            e["_d"] = math.hypot(float(e["pos"][0]) - x, float(e["pos"][1]) - y)
+            if ok and e["_d"] < 220.0:
+                visible.append(e)
+                self.attackers[e["id"]] = self.attackers.get(e["id"], t)
+                self.seen[e["id"]] = (float(e["pos"][0]), float(e["pos"][1]), float(e["pos"][2]), t)
+        self.seen = {i: v for i, v in self.seen.items() if t - v[3] < 8.0}
+        visible.sort(key=lambda e: e["_d"])
+        return me, x, y, z, t, zone, act, visible
+
+    def _finish_move(self, x, y, yaw, speed, boost, aim, fire, act, energy):
+        if yaw is None or speed <= 0:
+            act["move"] = [0.0, 0.0]
+            boost = False
+        else:
+            yaw = self.safe_dir(x, y, yaw)
+            act["move"] = [round(math.cos(yaw) * speed, 4), round(math.sin(yaw) * speed, 4)]
+        act["boost"] = bool(boost and energy > 1.0)
+        act["aim"] = [
+            round((aim[0] + math.pi) % (2 * math.pi) - math.pi, 4),
+            round(max(self.min_pitch, min(self.max_pitch, aim[1])), 4),
+        ]
+        act["fire"] = fire
+        return act
+
+    def act_pure(self, obs):
+        """Never shoot unless cornered. Live on the far rim, behind buildings, always moving."""
+        if not hasattr(self, "seen"):
+            self.seen = {}
+        me, x, y, z, t, zone, act, visible = self._sense(obs)
+        energy = float(me.get("energy", 0))
+        hpf = float(me["hp"]) / max(float(me.get("max_hp") or 1), 1.0)
+        if t - self.plan_t > 1.2 or not self.path:
+            self._pure_plan(x, y, zone)
+            self.plan_t = t
+        yaw = self._steer(x, y)
+        if yaw is None:
+            nx, ny = _xy(zone.get("next_center"), (x, y))
+            ang = math.atan2(y - ny, x - nx) + 0.55
+            nr = max(float(zone.get("next_radius", 0.0)) * 0.75, 10.0)
+            yaw = math.atan2((ny + math.sin(ang) * nr) - y, (nx + math.cos(ang) * nr) - x)
+        speed = 1.0
+        open_ground = self.wall_dist[self.node(x, y)] > 2.4
+        boost = energy > 28.0 and (open_ground or (self.path and len(self.path) > 8))
+        cornered = hpf < 0.28 and any(e["_d"] < 24.0 for e in visible)
+        boxed = sum(1 for e in visible if e["_d"] < 16.0) >= 2
+        fire = [False, False]
+        aim = [yaw, 0.02]
+        if visible and (cornered or boxed):
+            weapons = list(me.get("weapons") or [None, None])
+            while len(weapons) < 2:
+                weapons.append(None)
+            self.mode = "fight"
+            aim_y, aim_p, fire = self._aim_and_fire(
+                me, x, y, z + 7.0, visible[0], weapons, visible, visible, energy, guns_only=True
+            )
+            if aim_y is not None:
+                aim = [aim_y, aim_p]
+        return self._finish_move(x, y, yaw, speed, boost, aim, fire, act, energy)
+
+    def _pure_plan(self, x, y, zone):
+        src = self.node(x, y)
+        dist, pred = dijkstra(self.graph, indices=src, directed=False, return_predecessors=True, limit=700.0)
+        reach = np.isfinite(dist) & ~self.blk & self.main
+        nx, ny = _xy(zone.get("next_center"), (x, y))
+        nr = float(zone.get("next_radius", 0.0))
+        known = list(self.seen.values())[:6]
+        if known:
+            mx = sum(p[0] for p in known) / len(known)
+            my = sum(p[1] for p in known) / len(known)
+            ang = math.atan2(ny - my, nx - mx)
+        else:
+            ang = self.scan
+        rim = max(nr * 0.78, 12.0)
+        rx, ry = nx + math.cos(ang) * rim, ny + math.sin(ang) * rim
+        d_rim = np.hypot(self.cx - rx, self.cy - ry)
+        d_next = np.hypot(self.cx - nx, self.cy - ny)
+        inside = d_next <= max(nr - 18.0, 8.0) if nr >= 16.0 else d_next <= max(nr, 8.0)
+        sel = np.flatnonzero(reach & inside & (dist < 160.0))
+        if sel.size < 10:
+            sel = np.flatnonzero(reach & (dist < 160.0))
+        if sel.size == 0:
+            self.path = []
+            return
+        order = np.argsort(d_rim[sel])[:140]
+        cand = sel[order]
+        if known:
+            md = np.full(len(cand), 1e6)
+            for px, py, pz, _pt in known:
+                md = np.minimum(md, np.hypot(self.cx[cand] - px, self.cy[cand] - py))
+            score = md - 0.25 * d_rim[cand]
+            feet_z = self.W.surf(self.cx[cand], self.cy[cand])
+            feet = np.stack([self.cx[cand], self.cy[cand], np.asarray(feet_z, np.float64)], 1)
+            hidden = np.ones(len(cand), dtype=bool)
+            for px, py, pz, _pt in known[:4]:
+                eye = np.tile([px, py, pz + 8.0], (len(cand), 1))
+                hidden &= ~self.W.sees(eye, feet, canopy=False)
+            score = score + hidden.astype(np.float64) * 120.0
+            best = int(cand[int(np.argmax(score))])
+        else:
+            best = int(cand[int(np.argmin(d_rim[cand]))])
+        self.goal = best
+        self._write_path(src, best, pred)
+
+    def act_fortress(self, obs):
+        """Rush a ground pocket walled on three sides, face the opening, shoot what enters."""
+        if not hasattr(self, "seen"):
+            self.seen = {}
+        me, x, y, z, t, zone, act, visible = self._sense(obs)
+        energy = float(me.get("energy", 0))
+        if t - self.plan_t > 1.5 or not self.path:
+            self._fortress_plan(x, y, zone)
+            self.plan_t = t
+        yaw = self._steer(x, y)
+        here = self.node(x, y)
+        in_pocket = bool(self.wall_dist[here] <= 1.05 and here < len(self.pocket_face) and self.pocket_face[here] != 0.0)
+        # pocket_face 0 is also a valid east facing. Use a mask instead.
+        in_pocket = bool(np.isin(here, self.pocket)) if self.pocket.size else False
+        speed = 0.0 if in_pocket else 1.0
+        boost = (not in_pocket) and energy > 20.0
+        if in_pocket:
+            yaw = None
+            face = float(self.pocket_face[here])
+        else:
+            face = yaw if yaw is not None else me["aim"][0]
+        weapons = list(me.get("weapons") or [None, None])
+        while len(weapons) < 2:
+            weapons.append(None)
+        fire = [False, False]
+        aim = [face, 0.02]
+        if visible and in_pocket:
+            self.mode = "fight"
+            aim_y, aim_p, fire = self._aim_and_fire(
+                me, x, y, z + 7.0, visible[0], weapons, visible, visible, energy, guns_only=False
+            )
+            if aim_y is not None:
+                # Keep the body aimed at the opening unless the target is in it.
+                if abs(angdiff(aim_y, face)) < 0.9:
+                    aim = [aim_y, aim_p]
+                else:
+                    aim = [face, 0.0]
+                    fire = [False, False]
+        return self._finish_move(x, y, yaw, speed, boost, aim, fire, act, energy)
+
+    def _fortress_plan(self, x, y, zone):
+        src = self.node(x, y)
+        dist, pred = dijkstra(self.graph, indices=src, directed=False, return_predecessors=True, limit=800.0)
+        reach = np.isfinite(dist) & ~self.blk & self.main
+        nx, ny = _xy(zone.get("next_center"), (x, y))
+        nr = float(zone.get("next_radius", 0.0))
+        pocket = self.pocket[reach[self.pocket]] if self.pocket.size else self.pocket
+        if pocket.size == 0:
+            self.path = []
+            return
+        if nr >= 12.0:
+            inside = np.hypot(self.cx[pocket] - nx, self.cy[pocket] - ny) <= max(nr - 12.0, 8.0)
+            if int(inside.sum()) >= 3:
+                pocket = pocket[inside]
+        best = int(pocket[int(np.argmin(dist[pocket]))])
+        self.goal = best
+        self._write_path(src, best, pred)
+
+    def act_alpha(self, obs):
+        """Rush the nearest hunter and shoot. Grab a laser or lightning if it is in reach."""
+        if not hasattr(self, "seen"):
+            self.seen = {}
+        me, x, y, z, t, zone, act, visible = self._sense(obs)
+        energy = float(me.get("energy", 0))
+        weapons = list(me.get("weapons") or [None, None])
+        while len(weapons) < 2:
+            weapons.append(None)
+        held = {w.get("kind") for w in weapons if w}
+        yaw = None
+        target = visible[0] if visible else None
+        if target is None and self.seen:
+            px, py, pz, _pt = max(self.seen.values(), key=lambda v: v[3])
+            yaw = math.atan2(py - y, px - x)
+        elif target is not None:
+            yaw = math.atan2(float(target["pos"][1]) - y, float(target["pos"][0]) - x)
+        else:
+            nx, ny = _xy(zone.get("next_center"), (x, y))
+            yaw = math.atan2(ny - y, nx - x)
+        # A weapon on the ground beats chasing until the second slot is filled.
+        best_pick = None
+        best_d = 1e9
+        for p in obs.get("pickups") or []:
+            if p.get("kind") not in ("laser", "lightning") or p.get("kind") in held:
+                continue
+            d = math.hypot(float(p["pos"][0]) - x, float(p["pos"][1]) - y)
+            if d < best_d and d < 160.0:
+                best_d = d
+                best_pick = p
+        if best_pick is not None and weapons[1] is None:
+            yaw = math.atan2(float(best_pick["pos"][1]) - y, float(best_pick["pos"][0]) - x)
+            if best_d < float(self.pickup_r):
+                act["take"] = best_pick["id"]
+        self.mode = "fight"
+        fire = [False, False]
+        aim = [yaw if yaw is not None else me["aim"][0], 0.0]
+        if target is not None and best_pick is None:
+            aim_y, aim_p, fire = self._aim_and_fire(
+                me, x, y, z + 7.0, target, weapons, visible, visible, energy, guns_only=False
+            )
+            if aim_y is not None:
+                aim = [aim_y, aim_p]
+        boost = energy > 16.0
+        return self._finish_move(x, y, yaw, 1.0, boost, aim, fire, act, energy)
+
+    def act_barnacle(self, obs):
+        """Stay glued to a building on the side away from the squad. Do not cross the open."""
+        if not hasattr(self, "seen"):
+            self.seen = {}
+        me, x, y, z, t, zone, act, visible = self._sense(obs)
+        energy = float(me.get("energy", 0))
+        if t - self.plan_t > 1.0 or not self.path:
+            self._barnacle_plan(x, y, zone)
+            self.plan_t = t
+        yaw = self._steer(x, y)
+        if yaw is None:
+            # Slide along the wall instead of standing.
+            yaw = (self.scan + t * 0.15)
+        here = self.wall_dist[self.node(x, y)]
+        speed = 1.0
+        # Boost only while still in the open. Once against a building, walk.
+        boost = here > 2.2 and energy > 30.0
+        hpf = float(me["hp"]) / max(float(me.get("max_hp") or 1), 1.0)
+        fire = [False, False]
+        aim = [yaw, 0.02]
+        if visible and (hpf < 0.35 or any(e["_d"] < 18.0 for e in visible)):
+            weapons = list(me.get("weapons") or [None, None])
+            while len(weapons) < 2:
+                weapons.append(None)
+            self.mode = "fight"
+            aim_y, aim_p, fired = self._aim_and_fire(
+                me, x, y, z + 7.0, visible[0], weapons, visible, visible, energy, guns_only=True
+            )
+            if aim_y is not None:
+                aim = [aim_y, aim_p]
+                fire = fired
+        elif visible:
+            aim = [math.atan2(float(visible[0]["pos"][1]) - y, float(visible[0]["pos"][0]) - x), 0.0]
+        return self._finish_move(x, y, yaw, speed, boost, aim, fire, act, energy)
+
+    def _barnacle_plan(self, x, y, zone):
+        src = self.node(x, y)
+        dist, pred = dijkstra(self.graph, indices=src, directed=False, return_predecessors=True, limit=500.0)
+        reach = np.isfinite(dist) & ~self.blk & self.main
+        nx, ny = _xy(zone.get("next_center"), (x, y))
+        nr = float(zone.get("next_radius", 0.0))
+        known = list(self.seen.values())[:6]
+        hug = np.flatnonzero(reach & (self.wall_dist <= 1.2) & (dist < 80.0))
+        if nr >= 12.0 and hug.size:
+            inside = np.hypot(self.cx[hug] - nx, self.cy[hug] - ny) <= max(nr - 12.0, 8.0)
+            if int(inside.sum()) >= 4:
+                hug = hug[inside]
+        if hug.size == 0:
+            self.path = []
+            return
+        if known:
+            mx = sum(p[0] for p in known) / len(known)
+            my = sum(p[1] for p in known) / len(known)
+            # Far from the squad, close to us, still on the wall.
+            score = np.hypot(self.cx[hug] - mx, self.cy[hug] - my) - 0.35 * dist[hug]
+            best = int(hug[int(np.argmax(score))])
+        else:
+            best = int(hug[int(np.argmin(dist[hug]))])
+        self.goal = best
+        self._write_path(src, best, pred)
+
+    def _write_path(self, src, best, pred):
+        path = []
+        n = int(best)
+        guard = 0
+        while n != src and n >= 0 and guard < 4000:
+            path.append(int(n))
+            nxt = int(pred[n])
+            if nxt < 0:
+                self.path = []
+                return
+            n = nxt
+            guard += 1
+        if n != src:
+            self.path = []
+            return
+        path.reverse()
+        self.path = path
 
     def _plan(self, x, y, z, zone, threats):
         src = self.node(x, y)
