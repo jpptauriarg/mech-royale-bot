@@ -93,6 +93,10 @@ class Bot:
         self.last_hit_t = -1e9
         self.last_hit_by: Optional[float] = None
         self.was_out = False
+        self.peek_goal: Optional[Vec] = None
+        self.peek_until = -1.0
+        # After a peek, wait out regen. A hit we land also restarts that wait.
+        self.regen_ready = -1.0
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
@@ -335,6 +339,9 @@ class Bot:
     ) -> Vec:
         # Squad bots hunt on sight and do not fight each other. Stay on the
         # outer face of a building until one hunter is alone and we have cover.
+        peek = self._peek(obs, x, y, threats, dest_c, dest_r)
+        if peek is not None:
+            return peek
         if self._should_hide(obs, x, y, threats):
             camp = self._shadow_camp(obs, x, y, threats, dest_c, dest_r)
             if camp is not None:
@@ -429,7 +436,66 @@ class Bot:
     def _should_hide(self, obs: mf.Observation, x: float, y: float, threats: List[Dict[str, Any]]) -> bool:
         if float(obs["zone"]["radius"]) <= 100.0:
             return False
+        t = float(obs["t"])
+        if t < self.regen_ready or (self.peek_goal is not None and t < self.peek_until):
+            return True
         return self._isolated(obs, x, y, threats) is None
+
+    def _peek(
+        self,
+        obs: mf.Observation,
+        x: float,
+        y: float,
+        threats: List[Dict[str, Any]],
+        dest_c: Vec,
+        dest_r: float,
+    ) -> Optional[Vec]:
+        """Step onto a corner, shoot, then back off. Another peek waits out regen."""
+        t = float(obs["t"])
+        if self.peek_goal is not None and t < self.peek_until:
+            return self.peek_goal
+        if t < self.regen_ready:
+            return None
+        lone = self._isolated(obs, x, y, threats)
+        if lone is None:
+            return None
+        me = obs["self"]
+        if float(me["hp"]) < 0.8 * max(1.0, float(me["max_hp"])):
+            return None
+        if t < self.last_hit_t + 5.5:
+            return None
+        limit = max(0.0, dest_r - self._margin(dest_r))
+        arena = self.arena
+        i0, j0 = arena.cell_at(x, y)
+        cell = arena.cell
+        best = None
+        best_d = 1e18
+        for dj in range(-2, 3):
+            for di in range(-2, 3):
+                i, j = i0 + di, j0 + dj
+                if arena.is_blocked_cell(i, j):
+                    continue
+                if not any(
+                    arena.is_blocked_cell(i + ni, j + nj) for ni, nj in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                ):
+                    continue
+                px = arena.minx + (i + 0.5) * cell
+                py = arena.miny + (j + 0.5) * cell
+                if math.hypot(px - dest_c[0], py - dest_c[1]) > limit:
+                    continue
+                if not arena.los(px, py, lone["x"], lone["y"]):
+                    continue
+                travel = math.hypot(px - x, py - y)
+                if travel < best_d:
+                    best_d = travel
+                    best = (px, py)
+        if best is None:
+            return None
+        self.peek_goal = best
+        self.peek_until = t + 0.8
+        # Dealing damage restarts the 5 s regen wait, so don't peek again until it ends.
+        self.regen_ready = self.peek_until + 5.0
+        return best
 
     def _anchor(self, obs: mf.Observation, x: float, y: float, threats: List[Dict[str, Any]], dest_c: Vec) -> Vec:
         """Who we have to put a building in front of. A hit bearing counts before we see them."""
@@ -959,9 +1025,10 @@ class Bot:
         z: float,
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         visible = [th for th in threats if th.get("fresh") and not th.get("phantom")]
-        isolated = self._isolated(obs, x, y, threats)
-        if isolated is not None:
-            return isolated, True
+        if float(obs["t"]) >= self.regen_ready:
+            isolated = self._isolated(obs, x, y, threats)
+            if isolated is not None:
+                return isolated, True
         if not visible:
             return None, False
         if self._should_hide(obs, x, y, threats):
