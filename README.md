@@ -1,8 +1,6 @@
 # shade
 
-Survival-first bot for the Builders Buildathon Mech Royale track (`mechfight/1`). It plays for placement. The practice squad hunts only this mech and stays on the ground, so the bot jets onto a roof they cannot path onto and stays there until the zone forces a move. On the way it rotates early, dodges, and shoots only when a fight is already forced.
-
-Enclosed courtyards were checked and are not real pockets on this map: almost every building hole is filled by another prism. A roof blocks a ground eye standing at the wall. An eye far enough that the line clears the roof edge still sees the mech, because vision ignores pitch.
+Survival-first bot for the Builders Buildathon Mech Royale track (`mechfight/1`). It plays for placement: rotate into the next circle early, keep buildings between itself and other mechs, walk quietly when someone is close, dodge incoming fire, and shoot only when a fight is already forced.
 
 ## License
 
@@ -12,7 +10,7 @@ MIT. See `LICENSE`.
 
 Python 3 standard library only. No third-party packages.
 
-`mechfight.py` is the official kit wrapper (standard library, stdin/stdout loop and debug drawing), copied in as the kit allows. `check/check.py`, `mechfight.schema.json`, and `arena/` are from that same kit and are used to conformance-check the bot locally. The bot itself (`bot.py`, `nav.py`, `holds.py`) and the local placement harness (`harness/sim.py`) are this project's code.
+`mechfight.py` is the official kit wrapper (standard library, stdin/stdout loop and debug drawing), copied in as the kit allows. `check/check.py`, `mechfight.schema.json`, and `arena/` are from that same kit and are used to conformance-check the bot locally. The bot itself (`bot.py`, `nav.py`) and the local placement harness (`harness/sim.py`) are this project's code.
 
 ## Run
 

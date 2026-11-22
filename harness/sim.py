@@ -26,7 +26,6 @@ import traceback
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import holds as holdmap  # noqa: E402
 import nav  # noqa: E402
 from bot import Bot, ang_diff  # noqa: E402
 
@@ -142,8 +141,6 @@ class Fighter:
         self.death_t = None
         self.boosting = False
         self.bot = None
-        self.climb = 0.0
-        self.pocket_id = None
 
 
 class Bullet:
@@ -257,49 +254,13 @@ def spawn_points(rng: random.Random, arena: nav.Arena, n: int = 16):
     return pts[:n]
 
 
-def prism_at(arena, x: float, y: float, z: float) -> bool:
-    """True when this point is inside a solid prism, so a high shot can clear a roof."""
-    i, j = arena.cell_at(x, y)
-    for pi in arena._buckets.get((i, j), ()):
-        p, ring, holes, minx, maxx, miny, maxy = arena._prepared[pi]
-        if x < minx or x > maxx or y < miny or y > maxy:
-            continue
-        if z < p["base"] - 0.3 or z > p["top"] + 0.2:
-            continue
-        if not nav._pip(x, y, ring):
-            continue
-        if any(nav._pip(x, y, hole) for hole in holes):
-            continue
-        return True
-    return False
-
-
-def los3d(arena, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> bool:
-    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-    steps = max(2, int(dist / 3.0))
-    for s in range(1, steps):
-        t = s / steps
-        if prism_at(arena, x0 + dx * t, y0 + dy * t, z0 + dz * t):
-            return False
-    return True
-
-
-def elevated(arena, mech: Fighter) -> bool:
-    return mech.z > arena.height(mech.x, mech.y) + 6.0
-
-
-def can_see(arena, a: Fighter, b: Fighter, holds=()) -> bool:
+def can_see(arena, a: Fighter, b: Fighter) -> bool:
     dx = b.x - a.x
     dy = b.y - a.y
     d2 = dx * dx + dy * dy
     if d2 > SEE * SEE:
         return False
-    if elevated(arena, a) or elevated(arena, b):
-        eye = a.z + 8.0
-        if not (los3d(arena, a.x, a.y, eye, b.x, b.y, b.z + 4.5) or los3d(arena, a.x, a.y, eye, b.x, b.y, b.z + 9.0)):
-            return False
-    elif not fast_los(arena, a.x, a.y, b.x, b.y):
+    if not fast_los(arena, a.x, a.y, b.x, b.y):
         return False
     if d2 <= NEAR * NEAR:
         return True
@@ -308,12 +269,12 @@ def can_see(arena, a: Fighter, b: Fighter, holds=()) -> bool:
     return False
 
 
-def visible_ids(arena, agents, viewer: Fighter, now: float, holds=()):
+def visible_ids(arena, agents, viewer: Fighter, now: float):
     out = []
     for other in agents:
         if other is viewer or not other.alive:
             continue
-        if can_see(arena, viewer, other, holds):
+        if can_see(arena, viewer, other):
             viewer.seen[other.id] = now
         seen_t = viewer.seen.get(other.id)
         if seen_t is not None and now - seen_t <= MEMORY:
@@ -457,20 +418,7 @@ def make_obs(me: Fighter, enemies, zone, now: float, tick: int, projectiles, sou
     }
 
 
-def cell_blocked(arena, holds, me: Fighter, x: float, y: float) -> bool:
-    if arena.blocked_at(x, y):
-        # Shade, already on a roof, can walk the deck. The wall still stops everyone else.
-        if me.kind == "shade" and me.z > arena.height(me.x, me.y) + 6.0:
-            roof = holdmap.hold_at(holds, me.x, me.y)
-            if roof is not None and roof.contains(x, y):
-                return False
-        return True
-    if me.kind != "shade" and holdmap.hold_at(holds, x, y) is not None:
-        return True
-    return False
-
-
-def apply_move(me: Fighter, act, arena, now: float, holds=()):
+def apply_move(me: Fighter, act, arena, now: float):
     mv = act.get("move") or [0.0, 0.0]
     mx, my = float(mv[0]), float(mv[1])
     ml = math.hypot(mx, my)
@@ -503,84 +451,17 @@ def apply_move(me: Fighter, act, arena, now: float, holds=()):
     me.pitch = max(float(MECH["min_pitch"]), min(float(MECH["max_pitch"]), me.pitch))
     nx = me.x + me.vx * DT
     ny = me.y + me.vy * DT
-    if not cell_blocked(arena, holds, me, nx, ny):
+    if not arena.blocked_at(nx, ny):
         me.x, me.y = nx, ny
-    elif not cell_blocked(arena, holds, me, nx, me.y):
+    elif not arena.blocked_at(nx, me.y):
         me.x = nx
         me.vy *= 0.3
-    elif not cell_blocked(arena, holds, me, me.x, ny):
+    elif not arena.blocked_at(me.x, ny):
         me.y = ny
         me.vx *= 0.3
     else:
         me.vx = me.vy = 0.0
-    inside = holdmap.hold_at(holds, me.x, me.y) if holds else None
-    me.z = inside.z if inside is not None and me.kind == "shade" else arena.height(me.x, me.y)
-
-
-def resolve_vault(me: Fighter, act, arena, holds):
-    """Shade spends about two seconds of jet on the wall, then is in the courtyard.
-
-    House bots never take this branch. While the jet is running, shade is still
-    outside and can be shot.
-    """
-    if me.kind != "shade" or not holds:
-        return
-    mv = act.get("move") or [0.0, 0.0]
-    mx, my = float(mv[0]), float(mv[1])
-    boosting = me.boosting
-    here = holdmap.hold_at(holds, me.x, me.y)
-    if here is not None:
-        # Jetting outward: pop out beyond the wall once the climb finishes.
-        outward = mx * (me.x - here.x) + my * (me.y - here.y)
-        if boosting and outward > 0.05:
-            me.climb += DT
-            if me.climb >= 1.8:
-                mag = math.hypot(mx, my) or 1.0
-                ux, uy = mx / mag, my / mag
-                for dist in (16.0, 24.0, 34.0, 46.0):
-                    px, py = me.x + ux * dist, me.y + uy * dist
-                    if holdmap.hold_at(holds, px, py) is None and not arena.blocked_at(px, py):
-                        me.x, me.y = px, py
-                        me.z = arena.height(px, py)
-                        me.vx = me.vy = 0.0
-                        break
-                me.climb = 0.0
-        else:
-            me.climb = 0.0
-        return
-    if not boosting:
-        me.climb = max(0.0, me.climb - DT)
-        return
-    target = None
-    best = 1e9
-    for pocket in holds:
-        gap = pocket.gap(me.x, me.y)
-        if gap > 16.0 or gap < 0.3 or gap >= best:
-            continue
-        dx, dy = pocket.x - me.x, pocket.y - me.y
-        if mx * dx + my * dy <= 0.05:
-            continue
-        dist = math.hypot(dx, dy) or 1.0
-        ux, uy = dx / dist, dy / dist
-        wall = False
-        step = 2.0
-        while step < min(gap + 8.0, 18.0):
-            px, py = me.x + ux * step, me.y + uy * step
-            if arena.point_blocked(px, py) or arena.blocked_at(px, py):
-                wall = True
-                break
-            step += 2.0
-        if wall:
-            best = gap
-            target = pocket
-    if target is None:
-        me.climb = max(0.0, me.climb - DT * 0.5)
-        return
-    me.climb += DT
-    if me.climb >= 2.2:
-        me.x, me.y, me.z = target.x, target.y, target.z
-        me.vx = me.vy = 0.0
-        me.climb = 0.0
+    me.z = arena.height(me.x, me.y)
 
 
 def separate(arena, alive):
@@ -633,7 +514,7 @@ def fire_gun(me: Fighter, act, bullets, sounds_at):
     sounds_at.append((me, "gun", 320.0))
 
 
-def step_bullets(arena, bullets, agents, now, measured, pending_events, holds=()):
+def step_bullets(arena, bullets, agents, now, measured, pending_events):
     keep = []
     alive = [a for a in agents if a.alive]
     for b in bullets:
@@ -651,10 +532,7 @@ def step_bullets(arena, bullets, agents, now, measured, pending_events, holds=()
         wall_t = 2.0
         for s in range(1, steps + 1):
             tt = s / steps
-            px = x0 + (x1 - x0) * tt
-            py = y0 + (y1 - y0) * tt
-            pz = z0 + (z1 - z0) * tt
-            if prism_at(arena, px, py, pz):
+            if arena.blocked_at(x0 + (x1 - x0) * tt, y0 + (y1 - y0) * tt):
                 wall_t = tt
                 break
         for a in alive:
@@ -751,15 +629,7 @@ def finish_timeout(agents, now):
 def run_match(seed: int, mode: str, arena: nav.Arena):
     rng = random.Random(seed)
     zone_model = Zone(rng)
-    holds = holdmap.get_holds(ARENA_DIR)
     pts = spawn_points(rng, arena)
-    for i, (x, y) in enumerate(pts):
-        if holdmap.hold_at(holds, x, y) is None:
-            continue
-        for k in range(1, 40):
-            if holdmap.hold_at(holds, x, y + k * 6) is None and not arena.blocked_at(x, y + k * 6):
-                pts[i] = (x, y + k * 6)
-                break
     rng.shuffle(pts)
     kinds = []
     if mode == "ffa":
@@ -798,7 +668,6 @@ def run_match(seed: int, mode: str, arena: nav.Arena):
                 cubes.append(CubePile(x, y, arena.height(x, y), 1))
                 break
     bullets = []
-    inside_s = 0.0
     shared = {"orbit": rng.random() * math.tau, "t": 0.0}
     pending_sounds = []
     pending_events = []
@@ -808,7 +677,7 @@ def run_match(seed: int, mode: str, arena: nav.Arena):
     while now < DURATION and sum(1 for a in agents if a.alive) > 1 and measured.alive:
         zone = zone_model.at(now)
         alive = [a for a in agents if a.alive]
-        views = {a.id: visible_ids(arena, agents, a, now, holds) for a in alive}
+        views = {a.id: visible_ids(arena, agents, a, now) for a in alive}
         actions = {}
         shared["t"] = now
         for a in alive:
@@ -856,8 +725,7 @@ def run_match(seed: int, mode: str, arena: nav.Arena):
                 )
         fired = []
         for a in alive:
-            apply_move(a, actions[a.id], arena, now, holds)
-            resolve_vault(a, actions[a.id], arena, holds)
+            apply_move(a, actions[a.id], arena, now)
             if a.gun_cd > 0:
                 a.gun_cd = max(0.0, a.gun_cd - DT)
             if a.reload > 0:
@@ -878,7 +746,7 @@ def run_match(seed: int, mode: str, arena: nav.Arena):
                         }
                     )
         separate(arena, [a for a in agents if a.alive])
-        step_bullets(arena, bullets, agents, now, measured, pending_events, holds)
+        step_bullets(arena, bullets, agents, now, measured, pending_events)
         zc = zone["center"]
         for a in agents:
             if not a.alive:
@@ -915,8 +783,6 @@ def run_match(seed: int, mode: str, arena: nav.Arena):
                 give_cube(closest)
         cubes = remain
         resolve_deaths(agents, cubes, now)
-        if measured.alive and holdmap.hold_at(holds, measured.x, measured.y) is not None:
-            inside_s += DT
         shared["orbit"] += 0.035 * DT
         now += DT
         tick += 2  # server decide_every is 2 sim ticks; echo values only need to be unique
@@ -938,7 +804,6 @@ def run_match(seed: int, mode: str, arena: nav.Arena):
         "cubes": measured.cubes,
         "errors": errors,
         "alive": sum(1 for a in agents if a.alive),
-        "inside_s": round(inside_s, 1),
     }
 
 
@@ -977,8 +842,7 @@ def main():
             rows.append(row)
             print(
                 f"  {mode} seed {seed}: place {row['place']} score {row['score']} "
-                f"t={row['time']:.1f}s cause={row['cause']} hp={row['hp']} cubes={row['cubes']} "
-                f"inside={row['inside_s']}s err={row['errors']}"
+                f"t={row['time']:.1f}s cause={row['cause']} hp={row['hp']} cubes={row['cubes']} err={row['errors']}"
             )
         summarize(mode, rows)
         print(f"  elapsed {time.perf_counter() - mt:.1f}s")
