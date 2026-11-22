@@ -4,4 +4,6 @@ FROM python:3.13-slim
 RUN pip install --no-cache-dir numpy==2.5.5 scipy==1.18.1
 WORKDIR /bot
 COPY mechfight.py world.py bot.py maps.npz ./
+# Fortress pocket is the image default. Override at run time with -e MB_STRAT=main.
+ENV MB_STRAT=fortress
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
